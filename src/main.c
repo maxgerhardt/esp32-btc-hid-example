@@ -15,6 +15,7 @@
 #include "esp_gap_bt_api.h"
 #include <string.h>
 #include <inttypes.h>
+#include "HIDTypes.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -29,49 +30,51 @@ typedef struct {
     esp_hidd_app_param_t app_param;
     esp_hidd_qos_param_t both_qos;
     uint8_t protocol_mode;
-    SemaphoreHandle_t mouse_mutex;
-    TaskHandle_t mouse_task_hdl;
-    uint8_t buffer[REPORT_BUFFER_SIZE];
-    int8_t x_dir;
+    SemaphoreHandle_t keyboard_mutex;
+    TaskHandle_t keyboard_task_hdl;
+    uint8_t buffer[8]; // Keyboard report size
 } local_param_t;
 
 static local_param_t s_local_param = {0};
 
-// HID report descriptor for a generic mouse. The contents of the report are:
-// 3 buttons, moving information for X and Y cursors, information for a wheel.
-uint8_t hid_mouse_descriptor[] = {
-    0x05, 0x01,                    // USAGE_PAGE (Generic Desktop)
-    0x09, 0x02,                    // USAGE (Mouse)
-    0xa1, 0x01,                    // COLLECTION (Application)
-
-    0x09, 0x01,                    //   USAGE (Pointer)
-    0xa1, 0x00,                    //   COLLECTION (Physical)
-
-    0x05, 0x09,                    //     USAGE_PAGE (Button)
-    0x19, 0x01,                    //     USAGE_MINIMUM (Button 1)
-    0x29, 0x03,                    //     USAGE_MAXIMUM (Button 3)
-    0x15, 0x00,                    //     LOGICAL_MINIMUM (0)
-    0x25, 0x01,                    //     LOGICAL_MAXIMUM (1)
-    0x95, 0x03,                    //     REPORT_COUNT (3)
-    0x75, 0x01,                    //     REPORT_SIZE (1)
-    0x81, 0x02,                    //     INPUT (Data,Var,Abs)
-    0x95, 0x01,                    //     REPORT_COUNT (1)
-    0x75, 0x05,                    //     REPORT_SIZE (5)
-    0x81, 0x03,                    //     INPUT (Cnst,Var,Abs)
-
-    0x05, 0x01,                    //     USAGE_PAGE (Generic Desktop)
-    0x09, 0x30,                    //     USAGE (X)
-    0x09, 0x31,                    //     USAGE (Y)
-    0x09, 0x38,                    //     USAGE (Wheel)
-    0x15, 0x81,                    //     LOGICAL_MINIMUM (-127)
-    0x25, 0x7f,                    //     LOGICAL_MAXIMUM (127)
-    0x75, 0x08,                    //     REPORT_SIZE (8)
-    0x95, 0x03,                    //     REPORT_COUNT (3)
-    0x81, 0x06,                    //     INPUT (Data,Var,Rel)
-
-    0xc0,                          //   END_COLLECTION
-    0xc0                           // END_COLLECTION
+// HID report descriptor for a keyboard, taken from main.cpp REPORT_MAP
+uint8_t hid_keyboard_descriptor[] = {
+    USAGE_PAGE(1),      0x01,       // Generic Desktop Controls
+    USAGE(1),           0x06,       // Keyboard
+    COLLECTION(1),      0x01,       // Application
+    REPORT_ID(1),       0x01,       //   Report ID (1)
+    USAGE_PAGE(1),      0x07,       //   Keyboard/Keypad
+    USAGE_MINIMUM(1),   0xE0,       //   Keyboard Left Control
+    USAGE_MAXIMUM(1),   0xE7,       //   Keyboard Right Control
+    LOGICAL_MINIMUM(1), 0x00,       //   Each bit is either 0 or 1
+    LOGICAL_MAXIMUM(1), 0x01,
+    REPORT_COUNT(1),    0x08,       //   8 bits for the modifier keys
+    REPORT_SIZE(1),     0x01,       
+    HIDINPUT(1),        0x02,       //   Data, Var, Abs
+    REPORT_COUNT(1),    0x01,       //   1 byte (unused)
+    REPORT_SIZE(1),     0x08,
+    HIDINPUT(1),        0x01,       //   Const, Array, Abs
+    REPORT_COUNT(1),    0x06,       //   6 bytes (for up to 6 concurrently pressed keys)
+    REPORT_SIZE(1),     0x08,
+    LOGICAL_MINIMUM(1), 0x00,
+    LOGICAL_MAXIMUM(1), 0x65,       //   101 keys
+    USAGE_MINIMUM(1),   0x00,
+    USAGE_MAXIMUM(1),   0x65,
+    HIDINPUT(1),        0x00,       //   Data, Array, Abs
+    REPORT_COUNT(1),    0x05,       //   5 bits (Num lock, Caps lock, Scroll lock, Compose, Kana)
+    REPORT_SIZE(1),     0x01,
+    USAGE_PAGE(1),      0x08,       //   LEDs
+    USAGE_MINIMUM(1),   0x01,       //   Num Lock
+    USAGE_MAXIMUM(1),   0x05,       //   Kana
+    LOGICAL_MINIMUM(1), 0x00,
+    LOGICAL_MAXIMUM(1), 0x01,
+    HIDOUTPUT(1),       0x02,       //   Data, Var, Abs
+    REPORT_COUNT(1),    0x01,       //   3 bits (Padding)
+    REPORT_SIZE(1),     0x03,
+    HIDOUTPUT(1),       0x01,       //   Const, Array, Abs
+    END_COLLECTION(0)               // End application collection
 };
+const int hid_keyboard_descriptor_len = sizeof(hid_keyboard_descriptor);
 
 static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
 {
@@ -85,8 +88,6 @@ static char *bda2str(esp_bd_addr_t bda, char *str, size_t size)
     return str;
 }
 
-const int hid_mouse_descriptor_len = sizeof(hid_mouse_descriptor);
-
 /**
  * @brief Integrity check of the report ID and report type for GET_REPORT request from HID host.
  *        Boot Protocol Mode requires report ID. For Report Protocol Mode, when the report descriptor
@@ -96,7 +97,7 @@ const int hid_mouse_descriptor_len = sizeof(hid_mouse_descriptor);
 bool check_report_id_type(uint8_t report_id, uint8_t report_type)
 {
     bool ret = false;
-    xSemaphoreTake(s_local_param.mouse_mutex, portMAX_DELAY);
+    xSemaphoreTake(s_local_param.keyboard_mutex, portMAX_DELAY);
     do {
         if (report_type != ESP_HIDD_REPORT_TYPE_INPUT) {
             break;
@@ -121,54 +122,60 @@ bool check_report_id_type(uint8_t report_id, uint8_t report_type)
             esp_bt_hid_device_report_error(ESP_HID_PAR_HANDSHAKE_RSP_ERR_INVALID_REP_ID);
         }
     }
-    xSemaphoreGive(s_local_param.mouse_mutex);
+    xSemaphoreGive(s_local_param.keyboard_mutex);
     return ret;
 }
 
-// send the buttons, change in x, and change in y
-void send_mouse_report(uint8_t buttons, char dx, char dy, char wheel)
-{
+// Send a HID keyboard report
+typedef struct {
+    uint8_t modifiers;      // Modifier keys (bitmask)
+    uint8_t reserved;       // Reserved, always 0
+    uint8_t pressedKeys[6]; // Up to 6 keycodes
+} InputReport;
+
+void send_keyboard_report(const InputReport* report) {
+    xSemaphoreTake(s_local_param.keyboard_mutex, portMAX_DELAY);
     uint8_t report_id;
     uint16_t report_size;
-    xSemaphoreTake(s_local_param.mouse_mutex, portMAX_DELAY);
     if (s_local_param.protocol_mode == ESP_HIDD_REPORT_MODE) {
-        report_id = 0;
-        report_size = REPORT_PROTOCOL_MOUSE_REPORT_SIZE;
-        s_local_param.buffer[0] = buttons;
-        s_local_param.buffer[1] = dx;
-        s_local_param.buffer[2] = dy;
-        s_local_param.buffer[3] = wheel;
+        // Report Protocol Mode: 8 bytes, no report ID in data
+        report_id = 1; // Descriptor's report ID
+        report_size = 8;
+        s_local_param.buffer[0] = report->modifiers;
+        s_local_param.buffer[1] = report->reserved;
+        for (int i = 0; i < 6; ++i) {
+            s_local_param.buffer[2 + i] = report->pressedKeys[i];
+        }
+        esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, report_id, report_size, s_local_param.buffer);
     } else {
-        // Boot Mode
-        report_id = ESP_HIDD_BOOT_REPORT_ID_MOUSE;
-        report_size = ESP_HIDD_BOOT_REPORT_SIZE_MOUSE - 1;
-        s_local_param.buffer[0] = buttons;
-        s_local_param.buffer[1] = dx;
-        s_local_param.buffer[2] = dy;
+        // Boot Protocol Mode: 9 bytes, report ID in data
+        report_id = ESP_HIDD_BOOT_REPORT_ID_KEYBOARD;
+        report_size = ESP_HIDD_BOOT_REPORT_SIZE_KEYBOARD - 1;
+        // Boot report: [report_id][modifiers][reserved][6 keycodes]
+        s_local_param.buffer[0] = report->modifiers;
+        s_local_param.buffer[1] = report->reserved;
+        for (int i = 0; i < 6; ++i) {
+            s_local_param.buffer[2 + i] = report->pressedKeys[i];
+        }
+        esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, report_id, report_size, s_local_param.buffer);
     }
-    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, report_id, report_size, s_local_param.buffer);
-    xSemaphoreGive(s_local_param.mouse_mutex);
+    xSemaphoreGive(s_local_param.keyboard_mutex);
 }
 
-// move the mouse left and right
-void mouse_move_task(void *pvParameters)
+// Task to send 'A' key every 2 seconds
+void keyboard_task(void *pvParameters)
 {
-    const char *TAG = "mouse_move_task";
+    const char *TAG = "keyboard_task";
 
     ESP_LOGI(TAG, "starting");
+    // HID keycode for 'A' is 0x04 (USB HID Usage Tables)
+    InputReport report_press = { .modifiers = 0, .reserved = 0, .pressedKeys = {0x04, 0, 0, 0, 0, 0} };
+    InputReport report_release = { .modifiers = 0, .reserved = 0, .pressedKeys = {0, 0, 0, 0, 0, 0} };
     for (;;) {
-        s_local_param.x_dir = 1;
-        int8_t step = 10;
-        for (int i = 0; i < 2; i++) {
-            xSemaphoreTake(s_local_param.mouse_mutex, portMAX_DELAY);
-            s_local_param.x_dir *= -1;
-            xSemaphoreGive(s_local_param.mouse_mutex);
-            for (int j = 0; j < 100; j++) {
-                send_mouse_report(0, s_local_param.x_dir * step, 0, 0);
-                vTaskDelay(50 / portTICK_PERIOD_MS);
-            }
-        }
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        send_keyboard_report(&report_press);
+        vTaskDelay(100 / portTICK_PERIOD_MS); // Key press duration
+        send_keyboard_report(&report_release);
+        vTaskDelay(2000 / portTICK_PERIOD_MS); // Wait 2 seconds
     }
 }
 
@@ -227,22 +234,22 @@ void esp_bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
 
 void bt_app_task_start_up(void)
 {
-    s_local_param.mouse_mutex = xSemaphoreCreateMutex();
-    memset(s_local_param.buffer, 0, REPORT_BUFFER_SIZE);
-    xTaskCreate(mouse_move_task, "mouse_move_task", 2 * 1024, NULL, configMAX_PRIORITIES - 3, &s_local_param.mouse_task_hdl);
+    s_local_param.keyboard_mutex = xSemaphoreCreateMutex();
+    memset(s_local_param.buffer, 0, sizeof(s_local_param.buffer));
+    xTaskCreate(keyboard_task, "keyboard_task", 2 * 1024, NULL, configMAX_PRIORITIES - 3, &s_local_param.keyboard_task_hdl);
     return;
 }
 
 void bt_app_task_shut_down(void)
 {
-    if (s_local_param.mouse_task_hdl) {
-        vTaskDelete(s_local_param.mouse_task_hdl);
-        s_local_param.mouse_task_hdl = NULL;
+    if (s_local_param.keyboard_task_hdl) {
+        vTaskDelete(s_local_param.keyboard_task_hdl);
+        s_local_param.keyboard_task_hdl = NULL;
     }
 
-    if (s_local_param.mouse_mutex) {
-        vSemaphoreDelete(s_local_param.mouse_mutex);
-        s_local_param.mouse_mutex = NULL;
+    if (s_local_param.keyboard_mutex) {
+        vSemaphoreDelete(s_local_param.keyboard_mutex);
+        s_local_param.keyboard_mutex = NULL;
     }
     return;
 }
@@ -340,12 +347,12 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
                 report_len = REPORT_PROTOCOL_MOUSE_REPORT_SIZE;
             } else {
                 // Boot Mode
-                report_id = ESP_HIDD_BOOT_REPORT_ID_MOUSE;
-                report_len = ESP_HIDD_BOOT_REPORT_SIZE_MOUSE - 1;
+                report_id = ESP_HIDD_BOOT_REPORT_ID_KEYBOARD;
+                report_len = ESP_HIDD_BOOT_REPORT_SIZE_KEYBOARD - 1;
             }
-            xSemaphoreTake(s_local_param.mouse_mutex, portMAX_DELAY);
+            xSemaphoreTake(s_local_param.keyboard_mutex, portMAX_DELAY);
             esp_bt_hid_device_send_report(param->get_report.report_type, report_id, report_len, s_local_param.buffer);
-            xSemaphoreGive(s_local_param.mouse_mutex);
+            xSemaphoreGive(s_local_param.keyboard_mutex);
         } else {
             ESP_LOGE(TAG, "check_report_id failed!");
         }
@@ -357,15 +364,12 @@ void esp_bt_hidd_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param)
         ESP_LOGI(TAG, "ESP_HIDD_SET_PROTOCOL_EVT");
         if (param->set_protocol.protocol_mode == ESP_HIDD_BOOT_MODE) {
             ESP_LOGI(TAG, "  - boot protocol");
-            xSemaphoreTake(s_local_param.mouse_mutex, portMAX_DELAY);
-            s_local_param.x_dir = -1;
-            xSemaphoreGive(s_local_param.mouse_mutex);
         } else if (param->set_protocol.protocol_mode == ESP_HIDD_REPORT_MODE) {
             ESP_LOGI(TAG, "  - report protocol");
         }
-        xSemaphoreTake(s_local_param.mouse_mutex, portMAX_DELAY);
+        xSemaphoreTake(s_local_param.keyboard_mutex, portMAX_DELAY);
         s_local_param.protocol_mode = param->set_protocol.protocol_mode;
-        xSemaphoreGive(s_local_param.mouse_mutex);
+        xSemaphoreGive(s_local_param.keyboard_mutex);
         break;
     case ESP_HIDD_INTR_DATA_EVT:
         ESP_LOGI(TAG, "ESP_HIDD_INTR_DATA_EVT");
@@ -446,15 +450,14 @@ void app_main(void)
 
     vTaskDelay(2000 / portTICK_PERIOD_MS);
 
-    // Initialize HID SDP information and L2CAP parameters.
-    // to be used in the call of `esp_bt_hid_device_register_app` after profile initialization finishes
+    // Initialize HID SDP information and L2CAP parameters for keyboard
     do {
-        s_local_param.app_param.name = "Mouse";
-        s_local_param.app_param.description = "Mouse Example";
+        s_local_param.app_param.name = "Keyboard";
+        s_local_param.app_param.description = "Keyboard Example";
         s_local_param.app_param.provider = "ESP32";
-        s_local_param.app_param.subclass = ESP_HID_CLASS_MIC; // keep same with minor class of COD
-        s_local_param.app_param.desc_list = hid_mouse_descriptor;
-        s_local_param.app_param.desc_list_len = hid_mouse_descriptor_len;
+        s_local_param.app_param.subclass = ESP_HID_CLASS_KBD;
+        s_local_param.app_param.desc_list = hid_keyboard_descriptor;
+        s_local_param.app_param.desc_list_len = hid_keyboard_descriptor_len;
 
         memset(&s_local_param.both_qos, 0, sizeof(esp_hidd_qos_param_t)); // don't set the qos parameters
     } while (0);
