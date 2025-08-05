@@ -1,0 +1,4 @@
+.pio
+.vscode
+# force user to do edits in the sdkconfig.defaults file
+sdkconfig.esp32dev
